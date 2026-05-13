@@ -77,7 +77,10 @@ class CircuitBreaker:
         # TODO(student): handle HALF_OPEN failure explicitly and reset success counter.
         self.failure_count += 1
         self.success_count = 0
-        if self.state == CircuitState.HALF_OPEN or self.failure_count >= self.failure_threshold:
+        if self.state == CircuitState.HALF_OPEN:
+            self._transition(CircuitState.OPEN, "probe_failure")
+            self.opened_at = time.monotonic()
+        elif self.failure_count >= self.failure_threshold:
             self._transition(CircuitState.OPEN, "failure_threshold")
             self.opened_at = time.monotonic()
 

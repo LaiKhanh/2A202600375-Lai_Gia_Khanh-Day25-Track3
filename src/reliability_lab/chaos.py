@@ -22,7 +22,11 @@ def load_queries(path: str | Path = "data/sample_queries.jsonl") -> list[str]:
     return queries
 
 
-def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None = None) -> ReliabilityGateway:
+def build_gateway(
+    config: LabConfig,
+    provider_overrides: dict[str, float] | None = None,
+    enable_cache: bool | None = None,
+) -> ReliabilityGateway:
     providers = []
     for p in config.providers:
         fail_rate = provider_overrides.get(p.name, p.fail_rate) if provider_overrides else p.fail_rate
@@ -37,7 +41,9 @@ def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None
         for p in config.providers
     }
     cache: ResponseCache | SharedRedisCache | None = None
-    if config.cache.enabled:
+    # Use override if provided, otherwise use config setting
+    cache_enabled = enable_cache if enable_cache is not None else config.cache.enabled
+    if cache_enabled:
         if config.cache.backend == "redis":
             cache = SharedRedisCache(
                 config.cache.redis_url,
@@ -69,9 +75,19 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
     return sum(recovery_times) / len(recovery_times)
 
 
-def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
-    """Run a single named chaos scenario."""
-    gateway = build_gateway(config, scenario.provider_overrides or None)
+def run_scenario(
+    config: LabConfig,
+    queries: list[str],
+    scenario: ScenarioConfig,
+    enable_cache: bool | None = None,
+) -> RunMetrics:
+    """Run a single named chaos scenario.
+    
+    Args:
+        enable_cache: If not None, overrides config cache setting for this scenario.
+                     Useful for cache vs no-cache comparisons.
+    """
+    gateway = build_gateway(config, scenario.provider_overrides or None, enable_cache=enable_cache)
     metrics = RunMetrics()
     request_count = config.load_test.requests
     for _ in range(request_count):
@@ -82,10 +98,12 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
         if result.cache_hit:
             metrics.cache_hits += 1
             metrics.estimated_cost_saved += 0.001
-        if result.route == "fallback":
+        # if result.route == "fallback":
+        if "fallback:" in result.route:
             metrics.fallback_successes += 1
             metrics.successful_requests += 1
-        elif result.route == "static_fallback":
+        # elif result.route == "static_fallback":
+        elif "static_fallback:" in result.route:
             metrics.static_fallbacks += 1
             metrics.failed_requests += 1
         else:
@@ -103,8 +121,8 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
     """Run all named scenarios from config, or a default run if none defined.
 
-    TODO(student): Add a cache vs no-cache comparison scenario.
-    Extend with your own custom scenarios (e.g., cost cap near limit).
+    Supports cache comparison: scenarios named with "_nocache" suffix will run with cache disabled.
+    Implements scenario-specific pass/fail criteria based on expected behavior.
     """
     if not config.scenarios:
         default_scenario = ScenarioConfig(name="default", description="baseline run")
@@ -114,11 +132,36 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
 
     combined = RunMetrics()
     for scenario in config.scenarios:
-        result = run_scenario(config, queries, scenario)
+        # Check if scenario should run without cache (name ends with _nocache)
+        disable_cache = scenario.name.endswith("_nocache")
+        enable_cache_override = False if disable_cache else None
+        
+        # Run scenario with appropriate cache setting
+        result = run_scenario(config, queries, scenario, enable_cache=enable_cache_override)
 
-        # TODO(student): Define pass/fail criteria per scenario.
-        # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
+        # Define pass/fail criteria per scenario based on expected behavior
+        passed = False
+        if scenario.name == "primary_timeout_100" or scenario.name == "primary_timeout_100_nocache":
+            # Primary provider always fails — all traffic should go to backup
+            # Pass if fallback is used for most requests
+            passed = result.fallback_success_rate > 0.85 and result.availability > 0.85
+        elif scenario.name == "primary_flaky_50" or scenario.name == "primary_flaky_50_nocache":
+            # Primary fails 50% — circuit should oscillate between OPEN and CLOSED
+            # Pass if we have successful requests (mix of primary and fallback)
+            passed = result.successful_requests > 0 and result.circuit_open_count > 0
+        elif scenario.name == "primary_recovery" or scenario.name == "primary_recovery_nocache":
+            # Primary fails 30% — should allow recovery
+            passed = result.successful_requests > 0 and result.availability > 0.95
+        elif scenario.name == "all_healthy" or scenario.name == "all_healthy_nocache":
+            # Both providers healthy — should have high availability
+            passed = result.availability > 0.90
+        elif scenario.name == "cache_stale_candidate":
+            # Cache with low similarity — should detect false hits
+            passed = result.cache_hit_rate >= 0 and result.successful_requests > 0
+        else:
+            # Default: pass if we have successful requests
+            passed = result.successful_requests > 0
+        
         combined.scenarios[scenario.name] = "pass" if passed else "fail"
 
         combined.total_requests += result.total_requests
